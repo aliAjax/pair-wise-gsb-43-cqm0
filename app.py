@@ -16,6 +16,27 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "public_procurement.db"
 
+# 开标批次状态：pending=待核（监标/审计尚未全部通过），opened=已开标（已见证），
+# failed=核对不符整批停在待核，unwitnessed=历史数据无批次号回填
+BATCH_PENDING = "pending"
+BATCH_OPENED = "opened"
+BATCH_FAILED = "failed"
+BATCH_UNWITNESSED = "unwitnessed"
+
+BATCH_STATUS_LABELS = {
+    BATCH_PENDING: "待核",
+    BATCH_OPENED: "已开标",
+    BATCH_FAILED: "核对不符停在待核",
+    BATCH_UNWITNESSED: "未见证（历史回填）",
+}
+WITNESS_LABELS = {
+    BATCH_PENDING: "待核",
+    BATCH_OPENED: "已见证",
+    BATCH_FAILED: "核对失败",
+    BATCH_UNWITNESSED: "未见证",
+}
+ROLE_LABELS = {"supervisor": "监标人", "auditor": "审计员", "procurement": "采购员"}
+
 
 class DomainError(Exception):
     def __init__(self, message: str, status: int = 400):
@@ -102,6 +123,7 @@ class ProcurementService:
                     payload_hash TEXT NOT NULL,
                     price REAL NOT NULL,
                     status TEXT NOT NULL DEFAULT 'sealed',
+                    open_batch_id INTEGER,
                     version INTEGER NOT NULL DEFAULT 1,
                     submitted_by TEXT NOT NULL,
                     submitted_at TEXT NOT NULL,
@@ -154,6 +176,34 @@ class ProcurementService:
                     created_at TEXT NOT NULL,
                     resolved_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS open_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_no TEXT NOT NULL UNIQUE,
+                    tender_id INTEGER NOT NULL REFERENCES tenders(id),
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    initiated_by TEXT NOT NULL,
+                    initiated_at TEXT NOT NULL,
+                    supervisor_confirmed_by TEXT,
+                    supervisor_confirmed_at TEXT,
+                    auditor_confirmed_by TEXT,
+                    auditor_confirmed_at TEXT,
+                    opened_by TEXT,
+                    opened_at TEXT,
+                    failure_reason TEXT,
+                    failure_detail TEXT,
+                    failure_at TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE TABLE IF NOT EXISTS open_batch_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES open_batches(id),
+                    bid_id INTEGER NOT NULL REFERENCES bids(id),
+                    committed_hash TEXT NOT NULL,
+                    item_status TEXT NOT NULL DEFAULT 'pending',
+                    discrepancy TEXT,
+                    UNIQUE(batch_id,bid_id)
+                );
                 CREATE TABLE IF NOT EXISTS timeline (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     tender_id INTEGER REFERENCES tenders(id),
@@ -163,9 +213,52 @@ class ProcurementService:
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_bids_tender ON bids(tender_id,status);
+                CREATE INDEX IF NOT EXISTS idx_batch_items_batch ON open_batch_items(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_batch_tender ON open_batches(tender_id,status);
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
                 """
             )
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """历史数据库补齐批次列，并把无批次号的已开标数据回填为未见证。"""
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(bids)").fetchall()}
+        if "open_batch_id" not in cols:
+            conn.execute("ALTER TABLE bids ADD COLUMN open_batch_id INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_bids_batch ON bids(open_batch_id)")
+        legacy = conn.execute(
+            "SELECT tender_id, COUNT(*) AS c FROM bids WHERE open_batch_id IS NULL GROUP BY tender_id"
+        ).fetchall()
+        now = utcnow()
+        for group in legacy:
+            tender_id, count = group["tender_id"], group["c"]
+            batch_no = "LEGACY-%s-T%s" % (now[:10].replace("-", ""), tender_id)
+            suffix = 1
+            unique_no = batch_no
+            while conn.execute("SELECT 1 FROM open_batches WHERE batch_no=?", (unique_no,)).fetchone():
+                suffix += 1
+                unique_no = "%s-%s" % (batch_no, suffix)
+            cur = conn.execute(
+                """INSERT INTO open_batches(batch_no,tender_id,status,initiated_by,initiated_at,opened_by,opened_at,failure_reason)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (unique_no, tender_id, BATCH_UNWITNESSED, "system", now, "system", now,
+                 "历史开标数据缺少批次号与双方见证记录，按未见证状态回填"),
+            )
+            batch_id = cur.lastrowid
+            for row in conn.execute("SELECT id,payload_hash,status FROM bids WHERE tender_id=? AND open_batch_id IS NULL", (tender_id,)).fetchall():
+                conn.execute(
+                    "INSERT INTO open_batch_items(batch_id,bid_id,committed_hash,item_status) VALUES(?,?,?,?)",
+                    (batch_id, row["id"], row["payload_hash"],
+                     "opened" if row["status"] in {"opened", "qualified", "disqualified", "awarded"} else "sealed"),
+                )
+            conn.execute("UPDATE bids SET open_batch_id=? WHERE tender_id=? AND open_batch_id IS NULL", (batch_id, tender_id))
+            conn.execute(
+                "INSERT INTO timeline(tender_id,actor,action,details,created_at) VALUES(?,?,?,?,?)",
+                (tender_id, "system", "open_batch.backfilled",
+                 json.dumps({"batch_no": unique_no, "bid_count": count, "witness_status": "unwitnessed",
+                             "reason": "历史数据无批次号，按未见证回填"}, ensure_ascii=False, sort_keys=True), now),
+            )
+
 
     def _audit(self, conn: sqlite3.Connection, tender_id: int | None, actor: str,
                action: str, details: dict[str, Any]) -> None:
@@ -321,9 +414,47 @@ class ProcurementService:
             self._audit(conn, bid["tender_id"], actor, "bid.withdrawn", {"bid_id": bid_id})
             return dict(conn.execute("SELECT * FROM bids WHERE id=?", (bid_id,)).fetchone())
 
-    def open_bids(self, actor: str, role: str, tender_id: int, expected_version: int) -> dict[str, Any]:
+    def _batch_view(self, conn: sqlite3.Connection, batch: sqlite3.Row) -> dict[str, Any]:
+        items = []
+        for row in conn.execute(
+            """SELECT i.id,i.batch_id,i.bid_id,i.committed_hash,i.item_status,i.discrepancy,
+                      b.vendor_id,b.price,b.status
+               FROM open_batch_items i JOIN bids b ON b.id=i.bid_id
+               WHERE i.batch_id=? ORDER BY i.bid_id""",
+            (batch["id"],),
+        ).fetchall():
+            items.append(dict(row))
+        status = batch["status"]
+        return {
+            "id": batch["id"],
+            "batch_no": batch["batch_no"],
+            "tender_id": batch["tender_id"],
+            "status": status,
+            "status_label": BATCH_STATUS_LABELS.get(status, status),
+            "witness_status": WITNESS_LABELS.get(status, status),
+            "initiated_by": batch["initiated_by"],
+            "initiated_at": batch["initiated_at"],
+            "confirmers": {
+                "supervisor": batch["supervisor_confirmed_by"],
+                "auditor": batch["auditor_confirmed_by"],
+            },
+            "supervisor_confirmed_by": batch["supervisor_confirmed_by"],
+            "supervisor_confirmed_at": batch["supervisor_confirmed_at"],
+            "auditor_confirmed_by": batch["auditor_confirmed_by"],
+            "auditor_confirmed_at": batch["auditor_confirmed_at"],
+            "opened_by": batch["opened_by"],
+            "opened_at": batch["opened_at"],
+            "failure_reason": batch["failure_reason"],
+            "failure_detail": json.loads(batch["failure_detail"]) if batch["failure_detail"] else None,
+            "failure_at": batch["failure_at"],
+            "attempts": batch["attempts"],
+            "items": items,
+        }
+
+    def start_open_batch(self, actor: str, role: str, tender_id: int, expected_version: int) -> dict[str, Any]:
+        """采购员在截止后发起开标批次：快照本批 sealed 投标及其承诺哈希，不改变投标状态。"""
         actor = clean_actor(actor)
-        require_role(role, {"procurement", "supervisor"}, "开标")
+        require_role(role, {"procurement"}, "发起开标批次")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             tender = self._tender(conn, tender_id)
@@ -333,18 +464,173 @@ class ProcurementService:
                 raise DomainError("项目已变化，请刷新后重试", 409)
             if datetime.now(timezone.utc) < parse_time(tender["deadline"]):
                 raise DomainError("尚未到开标时间", 409)
-            rows = conn.execute("SELECT * FROM bids WHERE tender_id=? AND status='sealed' ORDER BY id", (tender_id,)).fetchall()
-            opened = []
+            blocking = conn.execute(
+                "SELECT * FROM open_batches WHERE tender_id=? AND status IN (?,?) ORDER BY id DESC LIMIT 1",
+                (tender_id, BATCH_PENDING, BATCH_FAILED),
+            ).fetchone()
+            if blocking:
+                view = self._batch_view(conn, blocking)
+                if blocking["status"] == BATCH_PENDING:
+                    raise DomainError("已有待核开标批次 %s，需监标人和审计员核对完成后再开标" % blocking["batch_no"], 409)
+                raise DomainError("开标批次 %s 核对不符停在待核，未解决前不能重新发起" % blocking["batch_no"], 409)
+            rows = conn.execute(
+                "SELECT * FROM bids WHERE tender_id=? AND status='sealed' ORDER BY id",
+                (tender_id,),
+            ).fetchall()
+            if not rows:
+                raise DomainError("没有待开标的密封投标", 409)
             now = utcnow()
+            seq = conn.execute("SELECT COUNT(*) AS c FROM open_batches").fetchone()["c"] + 1
+            batch_no = "OB-%s-T%s-%03d" % (now[:10].replace("-", ""), tender_id, seq)
+            cur = conn.execute(
+                """INSERT INTO open_batches(batch_no,tender_id,status,initiated_by,initiated_at)
+                   VALUES(?,?,?,?,?)""",
+                (batch_no, tender_id, BATCH_PENDING, actor, now),
+            )
+            batch_id = cur.lastrowid
             for row in rows:
-                digest = canonical_hash(json.loads(row["payload"]))
-                if digest != row["payload_hash"]:
-                    raise DomainError("投标完整性校验失败: %s" % row["id"], 409)
-                conn.execute("UPDATE bids SET status='opened',opened_at=?,version=version+1 WHERE id=?", (now, row["id"]))
-                opened.append(dict(conn.execute("SELECT * FROM bids WHERE id=?", (row["id"],)).fetchone()))
-            conn.execute("UPDATE tenders SET status='opened',version=version+1,updated_at=? WHERE id=?", (now, tender_id))
-            self._audit(conn, tender_id, actor, "tender.opened", {"bid_count": len(opened)})
-            return {"tender": dict(self._tender(conn, tender_id)), "bids": opened}
+                conn.execute(
+                    "INSERT INTO open_batch_items(batch_id,bid_id,committed_hash,item_status) VALUES(?,?,?,?)",
+                    (batch_id, row["id"], row["payload_hash"], "pending"),
+                )
+                conn.execute("UPDATE bids SET open_batch_id=? WHERE id=?", (batch_id, row["id"]))
+            self._audit(conn, tender_id, actor, "open_batch.initiated",
+                        {"batch_no": batch_no, "bid_count": len(rows),
+                         "bid_ids": [row["id"] for row in rows]})
+            return self._batch_view(conn, conn.execute("SELECT * FROM open_batches WHERE id=?", (batch_id,)).fetchone())
+
+    def confirm_open_batch(self, actor: str, role: str, batch_id: int) -> dict[str, Any]:
+        """监标人或审计员分别核对同一批承诺哈希；两方都通过才统一改变投标状态。
+
+        任一核对不符：整批停在待核（批次标记失败原因并保留差异），不改变任何投标状态，
+        失败批次不得进入评分或授标。写入异常时事务回滚到未开标，可重试且已确认方不重复处理。
+        """
+        actor = clean_actor(actor)
+        require_role(role, {"supervisor", "auditor"}, "核对开标批次")
+        role_label = ROLE_LABELS[role]
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            batch = conn.execute("SELECT * FROM open_batches WHERE id=?", (batch_id,)).fetchone()
+            if not batch:
+                raise DomainError("开标批次不存在", 404)
+            tender = self._tender(conn, batch["tender_id"])
+            if batch["status"] == BATCH_OPENED:
+                raise DomainError("开标批次 %s 已开标，无需重复核对" % batch["batch_no"], 409)
+            if batch["status"] in {BATCH_FAILED, BATCH_UNWITNESSED}:
+                raise DomainError("开标批次 %s 为%s状态，不能继续核对"
+                                  % (batch["batch_no"], BATCH_STATUS_LABELS[batch["status"]]), 409)
+
+            already_by = batch["supervisor_confirmed_by"] if role == "supervisor" else batch["auditor_confirmed_by"]
+            if already_by is not None:
+                if already_by != actor:
+                    raise DomainError("%s已由 %s 核对确认，不能由其他人重复确认" % (role_label, already_by), 409)
+                # 同一确认人重复调用：不重复处理，直接返回当前批次
+                self._audit(conn, tender["id"], actor, "open_batch.confirm_skipped",
+                            {"batch_no": batch["batch_no"], "role": role, "reason": "该方已确认，幂等跳过"})
+                conn.commit()
+                return self._batch_view(conn, batch)
+
+            # 逐项重新计算承诺哈希，与批次快照及投标当前承诺哈希核对
+            discrepancies = []
+            items = conn.execute("SELECT * FROM open_batch_items WHERE batch_id=? ORDER BY bid_id", (batch_id,)).fetchall()
+            for item in items:
+                bid = conn.execute("SELECT * FROM bids WHERE id=?", (item["bid_id"],)).fetchone()
+                if bid is None:
+                    discrepancies.append({"bid_id": item["bid_id"], "reason": "投标不存在"})
+                    continue
+                actual = canonical_hash(json.loads(bid["payload"]))
+                problems = []
+                if actual != item["committed_hash"]:
+                    problems.append("承诺哈希不一致")
+                if bid["payload_hash"] != item["committed_hash"]:
+                    problems.append("当前承诺哈希与批次快照不一致")
+                if bid["status"] != "sealed":
+                    problems.append("投标状态不是 sealed: %s" % bid["status"])
+                if problems:
+                    detail = ";".join(problems)
+                    discrepancies.append({
+                        "bid_id": bid["id"], "vendor_id": bid["vendor_id"],
+                        "expected_hash": item["committed_hash"], "actual_hash": actual,
+                        "current_hash": bid["payload_hash"], "reason": detail,
+                    })
+                    conn.execute("UPDATE open_batch_items SET item_status='mismatch',discrepancy=? WHERE id=?",
+                                 (detail, item["id"]))
+
+            if discrepancies:
+                reason = "%s核对发现 %d 份投标承诺哈希不符，整批停在待核" % (role_label, len(discrepancies))
+                conn.execute(
+                    """UPDATE open_batches SET status=?,failure_reason=?,failure_detail=?,failure_at=?,
+                          attempts=attempts+1,version=version+1 WHERE id=?""",
+                    (BATCH_FAILED, reason, json.dumps(discrepancies, ensure_ascii=False, sort_keys=True),
+                     utcnow(), batch_id),
+                )
+                self._audit(conn, tender["id"], actor, "open_batch.mismatch",
+                            {"batch_no": batch["batch_no"], "role": role, "role_label": role_label,
+                             "mismatch_count": len(discrepancies),
+                             "bid_ids": [d["bid_id"] for d in discrepancies], "failure_reason": reason})
+                conn.commit()
+                failed = conn.execute("SELECT * FROM open_batches WHERE id=?", (batch_id,)).fetchone()
+                view = self._batch_view(conn, failed)
+                view["error"] = reason
+                view["_http_status"] = 200
+                return view
+
+            now = utcnow()
+            if role == "supervisor":
+                conn.execute(
+                    "UPDATE open_batches SET supervisor_confirmed_by=?,supervisor_confirmed_at=?,attempts=attempts+1,version=version+1 WHERE id=?",
+                    (actor, now, batch_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE open_batches SET auditor_confirmed_by=?,auditor_confirmed_at=?,attempts=attempts+1,version=version+1 WHERE id=?",
+                    (actor, now, batch_id),
+                )
+            conn.execute("UPDATE open_batch_items SET item_status='confirmed' WHERE batch_id=?", (batch_id,))
+            self._audit(conn, tender["id"], actor, "open_batch.confirmed",
+                        {"batch_no": batch["batch_no"], "role": role, "role_label": role_label})
+
+            refreshed = conn.execute("SELECT * FROM open_batches WHERE id=?", (batch_id,)).fetchone()
+            if refreshed["supervisor_confirmed_by"] and refreshed["auditor_confirmed_by"]:
+                # 两方都通过：在同一事务内统一改变投标状态，任何写入失败整体回滚到未开标
+                opened_ids = []
+                for item in items:
+                    updated = conn.execute(
+                        "UPDATE bids SET status='opened',opened_at=?,version=version+1 "
+                        "WHERE id=? AND status='sealed'",
+                        (now, item["bid_id"]),
+                    )
+                    if updated.rowcount:
+                        opened_ids.append(item["bid_id"])
+                conn.execute(
+                    "UPDATE open_batches SET status=?,opened_by=?,opened_at=?,version=version+1 WHERE id=?",
+                    (BATCH_OPENED, actor, now, batch_id),
+                )
+                conn.execute(
+                    "UPDATE tenders SET status='opened',version=version+1,updated_at=? WHERE id=?",
+                    (now, tender["id"]),
+                )
+                self._audit(conn, tender["id"], actor, "open_batch.opened",
+                            {"batch_no": batch["batch_no"], "bid_count": len(opened_ids),
+                             "bid_ids": opened_ids,
+                             "confirmers": {"supervisor": refreshed["supervisor_confirmed_by"],
+                                            "auditor": refreshed["auditor_confirmed_by"]}})
+            conn.commit()
+            return self._batch_view(conn, conn.execute("SELECT * FROM open_batches WHERE id=?", (batch_id,)).fetchone())
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_open_batch(self, actor: str, role: str, batch_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            batch = conn.execute("SELECT * FROM open_batches WHERE id=?", (batch_id,)).fetchone()
+            if not batch:
+                raise DomainError("开标批次不存在", 404)
+            return self._batch_view(conn, batch)
+
 
     def declare_conflict(self, actor: str, role: str, tender_id: int, evaluator: str,
                          vendor_id: int | None, reason: str) -> dict[str, Any]:
@@ -376,6 +662,13 @@ class ProcurementService:
             tender = self._tender(conn, bid["tender_id"])
             if tender["status"] not in {"opened", "reevaluation"} or tender["evaluations_locked"]:
                 raise DomainError("当前项目不能评分", 409)
+            blocked_batch = conn.execute(
+                "SELECT batch_no,status FROM open_batches WHERE tender_id=? AND status IN (?,?) ORDER BY id DESC LIMIT 1",
+                (tender["id"], BATCH_PENDING, BATCH_FAILED),
+            ).fetchone()
+            if blocked_batch:
+                raise DomainError("开标批次 %s 处于%s状态，失败或待核批次不得进入评分"
+                                  % (blocked_batch["batch_no"], BATCH_STATUS_LABELS[blocked_batch["status"]]), 409)
             if bid["status"] not in {"opened", "qualified"}:
                 raise DomainError("该投标不能评分", 409)
             conflict = conn.execute(
@@ -524,6 +817,13 @@ class ProcurementService:
                 raise DomainError("当前项目不能授标", 409)
             if tender["version"] != int(expected_version):
                 raise DomainError("项目已变化，请刷新后重试", 409)
+            blocked_batch = conn.execute(
+                "SELECT batch_no,status FROM open_batches WHERE tender_id=? AND status IN (?,?) ORDER BY id DESC LIMIT 1",
+                (tender_id, BATCH_PENDING, BATCH_FAILED),
+            ).fetchone()
+            if blocked_batch:
+                raise DomainError("开标批次 %s 处于%s状态，失败批次不得进入授标"
+                                  % (blocked_batch["batch_no"], BATCH_STATUS_LABELS[blocked_batch["status"]]), 409)
             open_complaint = conn.execute("SELECT COUNT(*) AS c FROM complaints WHERE tender_id=? AND status='open'", (tender_id,)).fetchone()["c"]
             if open_complaint:
                 raise DomainError("存在未处理投诉，不能授标", 409)
@@ -547,18 +847,64 @@ class ProcurementService:
                 raise DomainError("没有可授标的有效投标", 409)
             ranking.sort(key=lambda item: (-item["score"], item["price"], item["bid_id"]))
             winner = ranking[0]
-            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"], "ranking": ranking, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
+            winning_batch = conn.execute(
+                "SELECT batch_no FROM open_batches WHERE id=(SELECT open_batch_id FROM bids WHERE id=?)",
+                (winner["bid_id"],),
+            ).fetchone()
+            snapshot = {"tender_id": tender_id, "round": tender["evaluation_round"],
+                        "open_batch_no": winning_batch["batch_no"] if winning_batch else None,
+                        "ranking": ranking, "winner": winner, "awarded_by": actor, "awarded_at": utcnow()}
             conn.execute(
                 "UPDATE tenders SET status='awarded',awarded_bid_id=?,award_snapshot=?,evaluations_locked=1,version=version+1,updated_at=? WHERE id=? AND version=?",
                 (winner["bid_id"], json.dumps(snapshot, ensure_ascii=False), utcnow(), tender_id, expected_version),
             )
             conn.execute("UPDATE bids SET status='awarded',version=version+1 WHERE id=?", (winner["bid_id"],))
-            self._audit(conn, tender_id, actor, "tender.awarded", {"winner": winner, "ranking": ranking})
+            self._audit(conn, tender_id, actor, "tender.awarded",
+                        {"winner": winner, "ranking": ranking,
+                         "open_batch_no": snapshot["open_batch_no"]})
             return {"tender": dict(self._tender(conn, tender_id)), "award": snapshot}
+
+    def _tender_batches(self, conn: sqlite3.Connection, tender_id: int) -> dict[int, dict[str, Any]]:
+        result = {}
+        for row in conn.execute("SELECT * FROM open_batches WHERE tender_id=? ORDER BY id", (tender_id,)).fetchall():
+            result[row["id"]] = {
+                "id": row["id"], "batch_no": row["batch_no"], "status": row["status"],
+                "status_label": BATCH_STATUS_LABELS.get(row["status"], row["status"]),
+                "witness_status": WITNESS_LABELS.get(row["status"], row["status"]),
+                "initiated_by": row["initiated_by"], "initiated_at": row["initiated_at"],
+                "supervisor_confirmed_by": row["supervisor_confirmed_by"],
+                "supervisor_confirmed_at": row["supervisor_confirmed_at"],
+                "auditor_confirmed_by": row["auditor_confirmed_by"],
+                "auditor_confirmed_at": row["auditor_confirmed_at"],
+                "opened_by": row["opened_by"], "opened_at": row["opened_at"],
+                "failure_reason": row["failure_reason"], "failure_at": row["failure_at"],
+                "confirmers": {
+                    "supervisor": row["supervisor_confirmed_by"],
+                    "auditor": row["auditor_confirmed_by"],
+                },
+            }
+        return result
+
+    def _attach_batch_info(self, item: dict[str, Any], batches: dict[int, dict[str, Any]]) -> None:
+        batch = batches.get(item.get("open_batch_id"))
+        if batch:
+            item["open_batch_no"] = batch["batch_no"]
+            item["witness_status"] = batch["witness_status"]
+        else:
+            item["open_batch_no"] = None
+            item["witness_status"] = "未见证" if item.get("status") == "opened" else None
 
     def get_tender(self, actor: str, role: str, tender_id: int) -> dict[str, Any]:
         with self.connect() as conn:
             tender = dict(self._tender(conn, tender_id))
+            batches = self._tender_batches(conn, tender_id)
+            latest = sorted(batches.values(), key=lambda b: b["id"])[-1] if batches else None
+            tender["open_batches"] = list(batches.values())
+            tender["open_batch_no"] = latest["batch_no"] if latest else None
+            tender["open_batch_status"] = latest["status"] if latest else None
+            tender["open_batch_status_label"] = latest["status_label"] if latest else None
+            tender["open_batch_confirmers"] = latest["confirmers"] if latest else {"supervisor": None, "auditor": None}
+            tender["open_batch_failure_reason"] = latest["failure_reason"] if latest else None
             bids = []
             if role in {"procurement", "supervisor", "auditor"} and tender["status"] in {"opened", "reevaluation", "awarded"}:
                 bids = [dict(r) for r in conn.execute("SELECT * FROM bids WHERE tender_id=? ORDER BY id", (tender_id,)).fetchall()]
@@ -575,24 +921,54 @@ class ProcurementService:
                     bids.append(item)
             else:
                 bids = [dict(r) for r in conn.execute(
-                    "SELECT id,tender_id,vendor_id,price,status,payload_hash,submitted_at,opened_at FROM bids WHERE tender_id=? ORDER BY id",
+                    "SELECT id,tender_id,vendor_id,price,status,open_batch_id,payload_hash,submitted_at,opened_at FROM bids WHERE tender_id=? ORDER BY id",
                     (tender_id,),
                 ).fetchall()]
+            for item in bids:
+                self._attach_batch_info(item, batches)
             clarifications = [dict(r) for r in conn.execute(
                 "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
                 (tender_id,),
             ).fetchall()]
-            return {"tender": tender, "bids": bids, "clarifications": clarifications}
+            return {"tender": tender, "bids": bids, "open_batches": list(batches.values()), "clarifications": clarifications}
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
             tenders = [dict(r) for r in conn.execute(
                 "SELECT id,tender_no,title,description,status,deadline,evaluation_round,version,awarded_bid_id,created_at,updated_at FROM tenders ORDER BY id DESC"
             ).fetchall()]
+            batch_by_tender: dict[int, dict[str, Any]] = {}
+            open_batches = []
+            for row in conn.execute("SELECT * FROM open_batches ORDER BY id DESC").fetchall():
+                view = {
+                    "id": row["id"], "batch_no": row["batch_no"], "tender_id": row["tender_id"],
+                    "status": row["status"], "status_label": BATCH_STATUS_LABELS.get(row["status"], row["status"]),
+                    "witness_status": WITNESS_LABELS.get(row["status"], row["status"]),
+                    "initiated_by": row["initiated_by"], "initiated_at": row["initiated_at"],
+                    "supervisor_confirmed_by": row["supervisor_confirmed_by"],
+                    "supervisor_confirmed_at": row["supervisor_confirmed_at"],
+                    "auditor_confirmed_by": row["auditor_confirmed_by"],
+                    "auditor_confirmed_at": row["auditor_confirmed_at"],
+                    "opened_by": row["opened_by"], "opened_at": row["opened_at"],
+                    "failure_reason": row["failure_reason"], "failure_at": row["failure_at"],
+                    "confirmers": {"supervisor": row["supervisor_confirmed_by"], "auditor": row["auditor_confirmed_by"]},
+                }
+                open_batches.append(view)
+                previous = batch_by_tender.get(row["tender_id"])
+                if previous is None or row["id"] > previous["id"]:
+                    batch_by_tender[row["tender_id"]] = view
+            batch_by_id = {b["id"]: b for b in open_batches}
+            for tender in tenders:
+                batch = batch_by_tender.get(tender["id"])
+                tender["open_batch_no"] = batch["batch_no"] if batch else None
+                tender["open_batch_status"] = batch["status"] if batch else None
+                tender["open_batch_status_label"] = batch["status_label"] if batch else None
+                tender["open_batch_confirmers"] = batch["confirmers"] if batch else {"supervisor": None, "auditor": None}
+                tender["open_batch_failure_reason"] = batch["failure_reason"] if batch else None
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 200").fetchall()]
             if role in {"procurement", "supervisor", "auditor"}:
                 bids = [dict(r) for r in conn.execute(
-                    """SELECT b.id,b.tender_id,b.vendor_id,b.price,b.status,b.payload_hash,b.submitted_at,b.opened_at,
+                    """SELECT b.id,b.tender_id,b.vendor_id,b.price,b.status,b.open_batch_id,b.payload_hash,b.submitted_at,b.opened_at,
                               CASE WHEN t.status IN ('opened','reevaluation','awarded') THEN b.payload ELSE NULL END AS payload
                        FROM bids b JOIN tenders t ON t.id=b.tender_id ORDER BY b.id DESC LIMIT 200"""
                 ).fetchall()]
@@ -614,7 +990,13 @@ class ProcurementService:
                 ).fetchall()]
             else:
                 bids, complaints = [], []
-        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline, "role": role}
+            for item in bids:
+                batch = batch_by_id.get(item.get("open_batch_id"))
+                item["open_batch_no"] = batch["batch_no"] if batch else None
+                item["witness_status"] = batch["witness_status"] if batch else (
+                    "未见证" if item.get("status") == "opened" else None)
+        return {"tenders": tenders, "bids": bids, "open_batches": open_batches,
+                "complaints": complaints, "timeline": timeline, "role": role}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -676,6 +1058,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, {"status": "ok", "service": "public-procurement"})
             elif path == "/api/state":
                 self._send(200, self.service.state(actor, role))
+            elif path.startswith("/api/open-batches/"):
+                self._send(200, self.service.get_open_batch(actor, role, int(path.split("/")[3])))
             elif path.startswith("/api/tenders/"):
                 self._send(200, self.service.get_tender(actor, role, int(path.split("/")[3])))
             else:
@@ -698,8 +1082,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.submit_bid(actor, role, **data)
             elif path == "/api/bids/withdraw":
                 result = self.service.withdraw_bid(actor, role, **data)
-            elif path == "/api/tenders/open":
-                result = self.service.open_bids(actor, role, **data)
+            elif path == "/api/tenders/open-batches":
+                result = self.service.start_open_batch(actor, role, **data)
+            elif path == "/api/open-batches/confirm":
+                result = self.service.confirm_open_batch(actor, role, **data)
             elif path == "/api/conflicts":
                 result = self.service.declare_conflict(actor, role, **data)
             elif path == "/api/evaluations":
@@ -718,7 +1104,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.award_tender(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
-            self._send(201, result)
+            status = result.pop("_http_status", 201) if isinstance(result, dict) else 201
+            self._send(status, result)
         except DomainError as exc:
             self._send(exc.status, {"error": str(exc)})
         except (KeyError, TypeError, ValueError) as exc:
